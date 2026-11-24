@@ -2,7 +2,16 @@
   "repository": "kitalo17/autosync",
   "scanned_commit": "a6c99f0fe799aab6ea7e711db0382d6fdae6eeae",
   "scan_date": "2026-11-24",
-  "focus": ["Authentication", "Authorization", "Cryptography", "Secrets"],
+  "focus": [
+    "Authentication",
+    "Authorization",
+    "Cryptography",
+    "Secrets",
+    "Injection",
+    "Logic Flaws",
+    "API Security",
+    "Infrastructure"
+  ],
   "findings": [
     {
       "id": "AUTO-001",
@@ -158,6 +167,99 @@
       ],
       "remediation": "Use parameterized SQL; encrypt or OS-protect stored SMS secrets; force HTTPS; remove credential logging.",
       "why_exploitable": "Confirmed write of secrets with unsafe SQL, confirmed cleartext HTTP transport of password, and confirmed logging—together a complete credential-theft chain for the SMS account."
+    },
+    {
+      "id": "AUTO-008",
+      "severity": "CRITICAL",
+      "location": "src/ConvertSQLiteToSQL/ConvertSQLiteToSQL.java",
+      "title": "SQL injection from Android SQLite field values into JHCIS MySQL during Up-to-JHCIS sync",
+      "description": "AndroidToJhcis pulls mJHCIS from the connected device, decrypts it, then ConvertSQLiteToSQL builds UPDATE/INSERT statements by string-concatenating every column value from the device SQLite ResultSet into Statement.executeUpdate against clinic JHCIS MySQL. No escaping or PreparedStatement is used for those values. Patient/visit text fields on a compromised or malicious tablet are attacker-controlled SQL.",
+      "impact": "Full read/write of the clinic JHCIS MySQL database (healthcare PHI), including arbitrary SQL via quote-breaking payloads in synced person/visit fields.",
+      "attack_path": [
+        "Attacker controls an Android device used for FFC fieldwork (malware, rooted tablet, or malicious replacement) and can write to mJHCIS.sdb/db.",
+        "Attacker plants a payload in a synced text column (e.g. person name) that breaks out of single-quoted SQL literals.",
+        "Clinic operator connects the device over ADB and runs Decrypt + Up to JHCIS (TransferForm → AndroidToJhcis).",
+        "DecryptDatabaseUpToJhcis pulls the DB; ConvertSQLiteToSQL.updatePerson / InsertData / insertVisit concatenate the payload into MySQL UPDATE/INSERT strings and execute them.",
+        "Attacker-controlled SQL runs with the AutoSync MySQL credentials against JHCIS."
+      ],
+      "evidence": [
+        "src/ConvertSQLiteToSQL/ConvertSQLiteToSQL.java:178-191",
+        "src/ConvertSQLiteToSQL/ConvertSQLiteToSQL.java:399-418",
+        "src/ConvertSQLiteToSQL/ConvertSQLiteToSQL.java:647-677",
+        "src/ConvertSQLiteToSQL/ConvertSQLiteToSQL.java:1136-1174",
+        "src/Transfer/AndroidToJhcis.java:64-87",
+        "src/Transfer/DecryptDatabaseUpToJhcis.java:68-81"
+      ],
+      "remediation": "Use PreparedStatement with bound parameters for every value written to MySQL. Never concatenate ResultSet string columns into SQL. Validate/normalize types (integers for pid/visitno) before use.",
+      "why_exploitable": "Device DB content is untrusted; the live Up-to-JHCIS path reads it and executes concatenated SQL on JHCIS. Not a local-operator-only issue."
+    },
+    {
+      "id": "AUTO-009",
+      "severity": "HIGH",
+      "location": "src/AdbManager/AdbFileManager.java",
+      "title": "Command injection via ADB device serial written into Windows .bat then executed",
+      "description": "Device serials from adb devices are stored and later concatenated into adbPull.bat / adbPush.bat / adbrm.bat without sanitization. RunAdb executes those .bat files with Runtime.exec, so cmd.exe metacharacters in the serial (&, |, etc.) run as host commands under the AutoSync Windows user.",
+      "impact": "Code execution on the clinic PC when a malicious/compromised Android USB device presents a crafted serial and the operator registers/syncs it.",
+      "attack_path": [
+        "Attacker supplies a USB Android (or gadget) whose ADB serial contains cmd metacharacters.",
+        "Operator registers the serial (InsertNewDevice stores the literal serial via PreparedStatement).",
+        "Operator connects; Service.serialDeviceConnect is set from the ADB list.",
+        "Sync/decrypt calls writeAdbBatFileCopyPull(serial, ...) writing adb -s <serial> pull ... into ./FFC/adb/adbPull.bat.",
+        "RunAdb.runAdb() executes the .bat; cmd parses the injected operators and runs attacker code on the PC."
+      ],
+      "evidence": [
+        "src/AdbManager/AdbFileManager.java:22-54",
+        "src/AdbManager/AdbFileManager.java:56-65",
+        "src/AdbManager/RunAdb.java:52-55",
+        "src/Transfer/DecryptDatabaseUpToJhcis.java:68-71",
+        "src/Transfer/AndroidToJhcis.java:118-122",
+        "src/DeviceManager/DriveBehavior.java:71-93"
+      ],
+      "remediation": "Never write shell/bat scripts with untrusted serials. Use ProcessBuilder with a string array and validate serials against a strict allowlist (e.g. ^[A-Za-z0-9._-]+$).",
+      "why_exploitable": "Serial is device-controlled, lands in a cmd-interpreted .bat, and is executed during normal sync—not local-operator self-injection of DB passwords."
+    },
+    {
+      "id": "AUTO-010",
+      "severity": "MEDIUM",
+      "location": "src/FileManager/FileManager.java",
+      "title": "Path traversal when copying Android-pulled photo filenames into JHCIS Photoes",
+      "description": "After adb pull of person photos, AndroidToJhcis copies ./FFC/Photoes_tmp/ into C:/Program Files/jhcis/Photoes using FileManager.copyDirectory, which joins each list() child name with new File(parent, child) without canonical-path confinement. A device-controlled filename containing Windows path separators/.. can write outside the Photoes directory.",
+      "impact": "Arbitrary file write as the AutoSync Windows user (e.g. user Startup folder), enabling persistence on the clinic PC from a compromised Android device.",
+      "attack_path": [
+        "Attacker places a file under the FFC person pictures directory on Android whose name includes ..\\ segments.",
+        "Operator runs Up to JHCIS; AndroidToJhcis pulls pictures into Photoes_tmp then copyFile to defaultJhcisPath/Photoes.",
+        "copyDirectory recursively builds target paths from untrusted names without checking they stay under Photoes.",
+        "Attacker-controlled content is written outside the intended directory."
+      ],
+      "evidence": [
+        "src/FileManager/FileManager.java:26-36",
+        "src/FileManager/FileManager.java:66-74",
+        "src/Transfer/AndroidToJhcis.java:110-130",
+        "src/Service/Service.java:38"
+      ],
+      "remediation": "Resolve each destination with File.getCanonicalFile() and reject paths that do not stay under the intended Photoes root. Sanitize filenames to a safe charset.",
+      "why_exploitable": "Filenames originate from the Android device during a trusted sync feature; same threat model as SQLi-from-device."
+    },
+    {
+      "id": "AUTO-011",
+      "severity": "MEDIUM",
+      "location": "src/FFC_Information/FFCInformationManager.java",
+      "title": "SQL injection in device registration check enables ADB device auth bypass",
+      "description": "checkDevice() and getInformation() concatenate the ADB serial into SQLite SQL with quotes instead of PreparedStatement (unlike InsertNewDevice/getFFCInformation which are parameterized). A crafted serial can make checkDevice return true without a matching registered row.",
+      "impact": "Bypass of the 'device must be registered' gate; pairs with bat command-injection by allowing a never-registered malicious serial to proceed into sync flows that write .bat files.",
+      "attack_path": [
+        "Attacker presents an ADB serial containing a SQLite quote breakout (OR 1=1 style).",
+        "ConnectDeviceAdb calls checkDevice(serial); concatenated query matches an existing row and returns true.",
+        "Service.serialDeviceConnect is set to the malicious serial and sync continues.",
+        "Downstream AdbFileManager writes the serial into .bat leading to host command execution (AUTO-009)."
+      ],
+      "evidence": [
+        "src/FFC_Information/FFCInformationManager.java:100-114",
+        "src/FFC_Information/FFCInformationManager.java:132-139",
+        "src/DeviceManager/ConnectDeviceAdb.java:36-40"
+      ],
+      "remediation": "Use PreparedStatement for all dserial comparisons (same pattern as InsertNewDevice). Additionally validate serial format before any use.",
+      "why_exploitable": "Serial is attacker-influenced via USB ADB; bypass is confirmed in source and feeds higher-impact bat injection."
     }
   ],
   "near_misses": [
@@ -185,6 +287,71 @@
       "title": "FileUser Register_user.ffc stores PII without encryption",
       "location": "src/FileManager/FileUser.java",
       "why_rejected": "Stores registration name/org/email, not authentication secrets or DB keys. Impact is local PII disclosure without an AuthN/AuthZ/crypto secret attack chain to MEDIUM+."
+    },
+    {
+      "title": "ExtractFile zip-slip path traversal",
+      "location": "src/CompressFile/ExtractFile.java",
+      "why_rejected": "destinationname+entryName has classic zip-slip, but ImportFileToAndroid comments out extract.getZipFiles(path); no other callers. Not reachable."
+    },
+    {
+      "title": "XXE in XMLWriter DocumentBuilder.parse",
+      "location": "src/XML/XMLWriter.java",
+      "why_rejected": "Factory has no XXE hardening, but parse target is a local app-owned path; XmlProcess is empty; no untrusted device/network XML is parsed."
+    },
+    {
+      "title": "Runtime.exec command injection in AdbCommand (non-bat)",
+      "location": "src/AdbManager/AdbCommand.java",
+      "why_rejected": "DirectoryPath/serial concatenated into Runtime.exec(String). Without cmd.exe, host injection is limited; callers use hardcoded Android paths. Host RCE is via .bat writers (AUTO-009) instead."
+    },
+    {
+      "title": "Backup/restore bat command injection via databaseName/backupPath",
+      "location": "src/Maintenance/BackupManager.java",
+      "why_rejected": "Values come from the local operator UI who already holds DB credentials—operator-equivalent, not a distinct attacker. Credential persistence is already AUTO-006."
+    },
+    {
+      "title": "SSRF via SendSms URL",
+      "location": "src/SendSms/SendSms.java",
+      "why_rejected": "URL is hardcoded to ffc.in.th; user fields are form-encoded body params, not URL control."
+    },
+    {
+      "title": "Java deserialization",
+      "location": "n/a",
+      "why_rejected": "No ObjectInputStream/readObject usage in application src."
+    },
+    {
+      "title": "MySQLiteConverter.sqliteSyncUpdateToMySQL SQLi",
+      "location": "src/MySQLiteConverter/MySQLiteConverter.java",
+      "why_rejected": "Same concatenation bug class, but convertSQLiteToMySQL has no current callers; live path is ConvertSQLiteToSQL (AUTO-008)."
+    },
+    {
+      "title": "SqlQuery / AdjustDatabaseSql string Statement use",
+      "location": "src/ConnectDatabase/SqlQuery.java",
+      "why_rejected": "SqlQuery uses PreparedStatement for parameters; AdjustDatabaseSql executes fixed DDL/constants, not device input."
+    },
+    {
+      "title": "FFC_Server as network-facing service",
+      "location": "src/FFC_Server/FFCServerManager.java",
+      "why_rejected": "Not a listening server; credential exposure already reported as AUTO-002."
+    }
+  ],
+  "scans": [
+    {
+      "focus": [
+        "Authentication",
+        "Authorization",
+        "Cryptography",
+        "Secrets"
+      ],
+      "run": "prior-auth-crypto"
+    },
+    {
+      "focus": [
+        "Injection",
+        "Logic Flaws",
+        "API Security",
+        "Infrastructure"
+      ],
+      "run": "bc-af35bdf3-28e5-53d1-8394-79afc87c109e"
     }
   ]
 }
