@@ -1,0 +1,190 @@
+{
+  "repository": "kitalo17/autosync",
+  "scanned_commit": "a6c99f0fe799aab6ea7e711db0382d6fdae6eeae",
+  "scan_date": "2026-11-24",
+  "focus": ["Authentication", "Authorization", "Cryptography", "Secrets"],
+  "findings": [
+    {
+      "id": "AUTO-001",
+      "severity": "CRITICAL",
+      "location": "src/SecurityNew/SecurityManager.java",
+      "title": "Hardcoded database encryption key decrypts mobile PHI databases",
+      "description": "The sync pipeline encrypts the JHCIS-derived SQLite database (mJHCIS.db containing patient/visit PHI) into mJHCIS.sdb using a compile-time DATABASE_KEY constant and a custom FFC XOR algorithm that leaves every other 256 KiB block in plaintext. The same key string is also used by the legacy Security.SecurityManager AES-CBC path with a fixed IV. Anyone who obtains mJHCIS.sdb (stolen tablet, ADB pull, disk copy) can decrypt it offline using the key recovered from the desktop JAR/source.",
+      "impact": "Full disclosure of synchronized healthcare PHI (persons, visits, diagnoses, labs, etc.) from any device or intermediate Db_tmp copy of mJHCIS.sdb. Encryption provides no meaningful confidentiality against an attacker with the app binary.",
+      "attack_path": [
+        "Obtain mJHCIS.sdb from an Android device path /sdcard/Android/data/th.in.ffc/databases/ (physical theft, malware, or ADB) or from ./FFC/Db_tmp/ on the clinic PC after sync.",
+        "Decompile autosync JAR or read SecurityNew.SecurityManager / Security.SecurityManager to recover DATABASE_KEY and the static AES IV / FFC key schedule.",
+        "Run the same decryptDatabaseFile() logic (or reimplement FFC XOR / AES-CBC) against mJHCIS.sdb to produce mJHCIS.db.",
+        "Open the resulting SQLite file and read PHI tables. For FFC mode, even without the key, every EVEN 256 KiB chunk is already plaintext on disk."
+      ],
+      "evidence": [
+        "src/SecurityNew/SecurityManager.java:18 (DATABASE_KEY assignment)",
+        "src/SecurityNew/SecurityManager.java:35-38 (ALGORITHM_FFC decrypt of mJHCIS.sdb)",
+        "src/SecurityNew/SecurityManager.java:72-75 (ALGORITHM_FFC encrypt)",
+        "src/SecurityNew/FFC_Algorithm.java:52-57 (XOR keystream)",
+        "src/SecurityNew/Crypto.java:108-118 (EVEN blocks written unencrypted)",
+        "src/Security/SecurityManager.java:31 (same DATABASE_KEY for AES path)",
+        "src/Security/Crypto.java:34-35 (hardcoded mAESiv)",
+        "src/Transfer/JhcisToAndroid.java:129-137 (encrypt then push sdb to device)",
+        "src/Transfer/DecryptDatabaseUpToJhcis.java:62-81 (pull sdb and decrypt with hardcoded key)"
+      ],
+      "remediation": "Remove hardcoded keys. Derive a per-installation or per-device key from OS keystore / user secret; use authenticated encryption (AES-GCM) with random IVs; never ship a static key in the client; encrypt the entire file; rotate keys and re-encrypt existing sdb files.",
+      "why_exploitable": "Not a false positive: the key is literally assigned in source, used on the live sync encrypt/decrypt path that handles PHI, and the ciphertext is deliberately placed on removable Android storage. The FFC EVEN-block plaintext further removes any doubt about impact."
+    },
+    {
+      "id": "AUTO-002",
+      "severity": "CRITICAL",
+      "location": "src/FFC_Server/FFCServerManager.java",
+      "title": "Hardcoded remote MySQL root credentials in client binary",
+      "description": "FFCServerManager hardcodes a public IP, MySQL port, database name, username root, and password as instance fields used by ConnectTest() via ConnectSQL. These values are recoverable from any distributed JAR/source checkout and grant direct database access if the host still accepts the credentials.",
+      "impact": "Remote compromise of the named MySQL instance as root: dump/alter user tables and any healthcare or registration data hosted in that schema; lateral movement on the DB host.",
+      "attack_path": [
+        "Obtain the autosync source or decompile the shipped JAR.",
+        "Read FFCServerManager constructor fields serverName, userNameDb, passwordDb, databaseName, portNumber.",
+        "Connect with a MySQL client to that host:port as the embedded root user.",
+        "SELECT/UPDATE/DUMP databases (constructor queries user table as a proof path)."
+      ],
+      "evidence": [
+        "src/FFC_Server/FFCServerManager.java:27-33 (hardcoded host, root user, passwordDb, databaseName)",
+        "src/FFC_Server/FFCServerManager.java:36-42 (ConnectSQL using those credentials)"
+      ],
+      "remediation": "Delete embedded production credentials from the client. If a remote admin API is required, use short-lived tokens, least-privilege DB users, network allowlists, and secrets injected at deploy time—never compile secrets into the desktop app.",
+      "why_exploitable": "Confirmed by reading the constructor: credentials are constants in source, not placeholders behind env vars. Presence in a client artifact is sufficient for exploitation against any still-reachable server accepting them; call-graph usage of ConnectTest is unnecessary for credential theft."
+    },
+    {
+      "id": "AUTO-003",
+      "severity": "HIGH",
+      "location": "src/FFC_Form/FFCRegisterUser.java",
+      "title": "Hardcoded Gmail SMTP account credentials for registration mail",
+      "description": "User registration builds a SendMail job with a hardcoded Gmail address and password passed into setVariable(), then authenticates to smtp.gmail.com over the network. The mailbox also appears as the From address in SendMail.",
+      "impact": "Account takeover of the registration mailbox; attacker can read registration PII (name, org, email, IP), send phishing as that identity, and abuse Google account recovery/linked services if still valid.",
+      "attack_path": [
+        "Decompile JAR or open FFCRegisterUser.java.",
+        "Extract the SMTP username/password arguments to setVariable().",
+        "Authenticate to smtp.gmail.com / Google account with those credentials (or use them until rotated).",
+        "Read inbound registration emails and/or send mail as ffcautosync mailbox."
+      ],
+      "evidence": [
+        "src/FFC_Form/FFCRegisterUser.java:466-468 (setVariable with hardcoded SMTP user/password)",
+        "src/MailManager/SendMail.java:130-138 (From address and transport.connect with those credentials)"
+      ],
+      "remediation": "Revoke/rotate the exposed Google account immediately. Replace with an app-password-free server-side mail relay or OAuth; never embed SMTP passwords in a desktop client.",
+      "why_exploitable": "Credentials are string literals on the live registration send path, not test stubs. Any holder of the binary can reuse them against the real SMTP host named in code."
+    },
+    {
+      "id": "AUTO-004",
+      "severity": "HIGH",
+      "location": "src/FileManager/FileSettingDataBaseFFCManager.java",
+      "title": "JHCIS MySQL credentials stored and exposed in plaintext config without auth",
+      "description": "FileSettingDataBaseFFCManager writes server/db/driver/port/username/password as a slash-delimited plaintext string to ./FFC/config_mysql_local.ffc. ConfigServerForm loads that password into the UI. LogInForm exposes a Setting Database button before authentication, so a local user who cannot log in can still open settings and read or change the clinic MySQL credentials. FileBehavior.readData also prints file contents to stdout.",
+      "impact": "Theft of JHCIS MySQL credentials → full access to the clinic health database (PHI and plaintext application user passwords). Unauthenticated local tampering of DB settings enables connection hijack.",
+      "attack_path": [
+        "On a clinic workstation running autosync, open the login screen and click Setting Database (no password required).",
+        "Alternatively read ./FFC/config_mysql_local.ffc from disk (world-readable relative path under the install dir) or observe console output from FileBehavior.readData.",
+        "Recover username/password from the form fields or the sixth slash-separated field in the file.",
+        "Connect to the configured MySQL server and access JHCIS data / user table."
+      ],
+      "evidence": [
+        "src/FileManager/FileSettingDataBaseFFCManager.java:19-31 (writeDriverDataBase writes password plaintext)",
+        "src/FileManager/FileSettingDataBaseFFCManager.java:34-36 (readDriverDataBase)",
+        "src/FileManager/FileBehavior.java:122 (prints file contents)",
+        "src/FFC_Form/ConfigServerForm.java:224-232 (persist credentials)",
+        "src/FFC_Form/ConfigServerForm.java:324-332 (load password into UI)",
+        "src/FFC_Form/LogInForm.java:225-227 (opens ConfigServerForm pre-auth)"
+      ],
+      "remediation": "Require successful login (or OS user ACL) before opening DB settings. Store credentials in the OS secret store or DPAPI/Keychain equivalent; never plaintext files. Stop logging secret material. Restrict filesystem ACLs on ./FFC.",
+      "why_exploitable": "Complete chain verified: plaintext write format, UI preload of password, and login-screen button that constructs ConfigServerForm with no auth check."
+    },
+    {
+      "id": "AUTO-005",
+      "severity": "HIGH",
+      "location": "src/FFC_Form/LogInForm.java",
+      "title": "Plaintext password verification and credential leakage across sync",
+      "description": "LogInForm authenticates by comparing the typed password to the password column from MySQL user with String.equals (plaintext). It also prints the typed password to stdout. ConvertDatabase.hashUserPassword reads those plaintext MySQL passwords, logs them, then stores unsalted Base64(SHA-256(password)) into uJHCIS.db, which is pushed to Android unencrypted (not wrapped by SecurityManager).",
+      "impact": "Anyone with MySQL, console logs, or a stolen tablet user DB can recover or crack clinic staff credentials and impersonate users on desktop/Android FFC workflows.",
+      "attack_path": [
+        "Gain read access to JHCIS MySQL user table (via AUTO-004 credentials, DB backup, or insider) and read plaintext passwords directly; OR",
+        "Capture stdout during login (passwordField.getText printed) or during Android sync (hashUserPassword prints pcu:username:plaintext); OR",
+        "Pull /sdcard/.../uJHCIS.db from a device and offline-crack unsalted SHA-256 hashes.",
+        "Reuse the recovered password in LogInForm (plaintext compare) or on the Android app."
+      ],
+      "evidence": [
+        "src/FFC_Form/LogInForm.java:161 (prints typed password)",
+        "src/FFC_Form/LogInForm.java:169-177 (loads DB password; equals plaintext compare)",
+        "src/Transfer/ConvertDatabase.java:685-708 (reads plaintext; prints it; SHA-256 without salt)",
+        "src/Security/MdManager.java:17-37 (raw SHA-256 + Base64)",
+        "src/Transfer/JhcisToAndroid.java:125-146 (hash then push uJHCIS.db without encryption)"
+      ],
+      "remediation": "Store passwords with a modern KDF (Argon2id/bcrypt/scrypt) and salt; never log secrets; encrypt uJHCIS.db at rest on device; stop printing credentials; migrate existing plaintext MySQL passwords.",
+      "why_exploitable": "Code path shows MySQL passwords are treated as reversible plaintext for login and logged during sync; Android hashes are unsalted and the user DB file is not encrypted by SecurityManager—each step is confirmed in source."
+    },
+    {
+      "id": "AUTO-006",
+      "severity": "HIGH",
+      "location": "src/Maintenance/BackupManager.java",
+      "title": "MySQL password written into backup/restore .bat files on disk",
+      "description": "Backup and restore flows take credentials from config_mysql_local.ffc and write mysqldump/mysql commands that embed -uUSER -pPASSWORD into ./FFC/backup.bat and the restore bat. The password remains on disk after the operation.",
+      "impact": "Local attacker or malware reading the bat file obtains JHCIS MySQL credentials and can dump or overwrite the health database.",
+      "attack_path": [
+        "Wait for or trigger Maintenance backup/restore.",
+        "Read ./FFC/backup.bat (or restore bat) written by BackupManager/RestoreManager.",
+        "Extract -p<password> and -u<user> from the command line.",
+        "Use credentials against the local/remote MySQL server."
+      ],
+      "evidence": [
+        "src/Maintenance/BackUp.java:69-74 (loads config; writeBatFileBackup with password)",
+        "src/Maintenance/BackupManager.java:22-34 (embeds -p + password in bat)",
+        "src/Maintenance/RestoreManager.java:21-33 (same for restore)"
+      ],
+      "remediation": "Pass credentials via mysqldump defaults-extra-file with restrictive ACLs, environment variables cleared after use, or interactive prompt; delete bat files after execution; never concatenate passwords into scripts.",
+      "why_exploitable": "writeBatFileBackup explicitly concatenates serverPassword into a file under ./FFC; BackUp always uses that path before exec."
+    },
+    {
+      "id": "AUTO-007",
+      "severity": "MEDIUM",
+      "location": "src/FFC_Form/TransferForm.java",
+      "title": "SMS gateway credentials stored plaintext with SQL injection and cleartext HTTP",
+      "description": "Appointment SMS settings persist username/password into SQLite table sms_login via string-concatenated SQL. Credentials are reloaded into UI fields and posted over http:// (not HTTPS) to the SMS gateway, with the full POST body printed to stdout.",
+      "impact": "Theft of SMS provider credentials (local DB read, SQLi via crafted username/password fields, or network sniffing) enabling fraudulent SMS and abuse of the clinic SMS account; possible SQLite integrity issues via injection.",
+      "attack_path": [
+        "As a logged-in operator (or anyone who can open TransferForm SMS settings), enter a password containing a quote to break out of the UPDATE statement, or simply save normal credentials.",
+        "Read ./FFC/FFC_Information.db sms_login table, or sniff LAN/proxy traffic to http://www.ffc.in.th/ffc_sendsms/thsms.php, or read console logs of SendSms.send().",
+        "Reuse stolen SMS credentials against the gateway."
+      ],
+      "evidence": [
+        "src/FFC_Form/TransferForm.java:3551-3557 (concatenated UPDATE of username/password)",
+        "src/FFC_Form/TransferForm.java:3560-3568 (loads plaintext into UI)",
+        "src/SendSms/SendSms.java:43-54 (HTTP POST of password; System.out.println of body)"
+      ],
+      "remediation": "Use parameterized SQL; encrypt or OS-protect stored SMS secrets; force HTTPS; remove credential logging.",
+      "why_exploitable": "Confirmed write of secrets with unsafe SQL, confirmed cleartext HTTP transport of password, and confirmed logging—together a complete credential-theft chain for the SMS account."
+    }
+  ],
+  "near_misses": [
+    {
+      "title": "Login SQL string concatenation on username",
+      "location": "src/FFC_Form/LogInForm.java:163",
+      "why_rejected": "Username comes from a JComboBox populated only from SELECT username FROM user, not free text. Without a separate write path to poison usernames, there is no attacker-controlled input into that query from the UI. Not reported without that chain."
+    },
+    {
+      "title": "Register_user.ffc forge / agreement registration bypass",
+      "location": "src/FFC_Form/FFCAgreement.java:258-268",
+      "why_rejected": "Accepting the agreement calls showMainMenu() whether or not registration exists; this only gates a soft license/registration UX, not access to PHI. Real gate remains MySQL login. Insufficient authorization impact for MEDIUM+ under AuthZ rules."
+    },
+    {
+      "title": "officerposition never enforced for authorization",
+      "location": "src/User/User.java / MainForm.setUser",
+      "why_rejected": "Position is displayed only; there is no role-based control plane to escalate. Missing RBAC without a privileged action check is a design gap, not a demonstrated privilege-escalation exploit."
+    },
+    {
+      "title": "Static AES IV / MD5 key derivation in isolation",
+      "location": "src/Security/Crypto.java",
+      "why_rejected": "Isolated weak-crypto patterns are folded into AUTO-001 because the exploitable issue is the hardcoded key protecting PHI. Per instructions, weak crypto alone without an obtainable ciphertext attack is not separately reported."
+    },
+    {
+      "title": "FileUser Register_user.ffc stores PII without encryption",
+      "location": "src/FileManager/FileUser.java",
+      "why_rejected": "Stores registration name/org/email, not authentication secrets or DB keys. Impact is local PII disclosure without an AuthN/AuthZ/crypto secret attack chain to MEDIUM+."
+    }
+  ]
+}
